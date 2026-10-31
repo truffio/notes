@@ -29,6 +29,7 @@ Send these to the bot. Anything else is saved as a note.
 | `/cancel <number>` | Cancels a reminder by the number shown in `/reminders`. |
 | `/timezone <name>` | Sets your timezone, such as `America/Toronto`. |
 | `/mcptoken <name>` | Creates a token for Claude access. Shown once. |
+| `/mcprevoke <name>` | Revokes that token. |
 | `/help` or `/start` | Shows the help text. |
 
 Only text messages are saved. Other message types get "Text only for now."
@@ -130,8 +131,9 @@ notes.example.com {
 ### Docker Compose
 
 1. Create `.env` from `.env.example`. Set `BASE_URL` to your https address, set
-   `TELEGRAM_WEBHOOK_SECRET` to a long random string, and set `POSTGRES_PASSWORD`
-   to letters and digits only.
+   `TELEGRAM_WEBHOOK_SECRET` to 32 to 256 letters, digits, `_` or `-` (the server
+   refuses to start otherwise; `openssl rand -hex 32` works), and set
+   `POSTGRES_PASSWORD` to letters and digits only.
 
 2. Build and start:
 
@@ -156,8 +158,9 @@ The MCP server is read-only. It exposes four tools: `search_notes`, `get_note`,
 starts over stdio.
 
 1. In Telegram, send `/mcptoken <name>` to your bot, for example `/mcptoken laptop`.
-   Copy the token it shows. It is not shown again. The app has no command to revoke
-   a token yet, so keep it secret.
+   Copy the token it shows. It is not shown again, so keep it secret. To revoke it,
+   send `/mcprevoke <name>`, then restart the MCP server, which checks its token
+   only at startup.
 
 2. Add the server to your Claude client's MCP configuration. Use absolute paths,
    and set `MCP_API_TOKEN` and the database variable. For a Docker deployment,
@@ -205,5 +208,7 @@ startup if neither is set or if `MCP_API_TOKEN` is not a valid token.
   reverse proxy, every client arrives from the proxy's address and shares one
   limit, so 10 login requests from anyone in a minute block everyone else's login
   for the rest of that minute.
-- **No token revocation.** There is no command to revoke an MCP token. Create
-  new tokens only for trusted clients.
+- **MCP tokens are checked only at startup.** A running MCP server keeps working
+  after `/mcprevoke` until it restarts, and tokens do not expire.
+- **Private chats only.** The bot ignores group chats, so login links and tokens
+  are never posted to a group.
