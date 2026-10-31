@@ -167,16 +167,32 @@ describe('telegram channel (polling)', () => {
     await channel.stop();
   });
 
-  it('keeps polling after a handler error', async () => {
+  it('retries a failed save, then tells the sender and keeps polling', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     const transport = fakeTransport([textUpdate(30, 'bad'), textUpdate(31, 'good')]);
-    const channel = createTelegramChannel({ token: 't', transformer: transport.transformer, botInfo });
+    const channel = createTelegramChannel({ token: 't', transformer: transport.transformer, botInfo, retryDelayMs: 1 });
+    const seen: string[] = [];
     await channel.start(async (m) => {
+      seen.push(m.text);
       if (m.text === 'bad') throw new Error('boom');
       return 'ok';
     });
-    await vi.waitFor(() => expect(transport.sent()).toHaveLength(1));
+    await vi.waitFor(() => expect(transport.sent()).toHaveLength(2));
+    expect(transport.sent().map((p) => p.text)).toEqual(["Couldn't save that. Please send it again.", 'ok']);
+    expect(seen).toEqual(['bad', 'bad', 'bad', 'good']);
     await channel.stop();
     error.mockRestore();
+  });
+
+  it('recovers when a retry succeeds', async () => {
+    const transport = fakeTransport([textUpdate(40, 'flaky')]);
+    const channel = createTelegramChannel({ token: 't', transformer: transport.transformer, botInfo, retryDelayMs: 1 });
+    let calls = 0;
+    await channel.start(async () => {
+      if (++calls === 1) throw new Error('boom');
+      return 'saved';
+    });
+    await vi.waitFor(() => expect(transport.sent().map((p) => p.text)).toEqual(['saved']));
+    await channel.stop();
   });
 });

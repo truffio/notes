@@ -411,6 +411,12 @@ function createStores(db: Queryable) {
       await db.query('DELETE FROM sessions WHERE token_hash = $1', [tokenHash]);
     },
 
+    /** Removes expired login tokens and sessions. Run periodically. */
+    async purgeExpired(now: Date): Promise<void> {
+      await db.query('DELETE FROM login_tokens WHERE expires_at <= $1', [now.toISOString()]);
+      await db.query('DELETE FROM sessions WHERE expires_at <= $1', [now.toISOString()]);
+    },
+
     async createApiToken(userId: string, tokenHash: string, name: string): Promise<void> {
       await db.query('INSERT INTO api_tokens (token_hash, user_id, name) VALUES ($1, $2, $3)', [
         tokenHash,
@@ -429,6 +435,11 @@ function createStores(db: Queryable) {
   };
 
   const updates = {
+    /** Telegram stops redelivering long before `before`, so old marks can go. */
+    async purgeBefore(before: Date): Promise<void> {
+      await db.query('DELETE FROM processed_updates WHERE processed_at < $1', [before.toISOString()]);
+    },
+
     /** Returns false if this update was already handled. */
     async markProcessed(channel: string, updateId: string): Promise<boolean> {
       const { rows } = await db.query(

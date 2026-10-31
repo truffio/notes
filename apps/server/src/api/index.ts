@@ -1,5 +1,5 @@
 import { getConnInfo } from '@hono/node-server/conninfo';
-import type { Api, MessageParser, MeResponse, User } from '@notes/core';
+import type { Api, LinkEnricher, MessageParser, MeResponse, User } from '@notes/core';
 import { ConflictError, type Repositories } from '@notes/db';
 import { Hono, type Context } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
@@ -31,6 +31,8 @@ export interface ApiDeps {
   repos: Repositories;
   parse: MessageParser;
   secureCookies: boolean;
+  /** Fills link previews in the background. Without it, web notes have none. */
+  enrich?: LinkEnricher;
   now?: () => Date;
 }
 
@@ -125,18 +127,30 @@ export function createApi(deps: ApiDeps): Hono {
    * Never loses a message: if the parser throws, the note keeps its raw text.
    * Parsed tags are checked here because the parser puts no limit on their length.
    */
-  function parseNote(input: string): { text: string; tags: string[] } {
-    let parsed: { text: string; tags: string[] };
+  function parseNote(input: string): { text: string; tags: string[]; urls: string[] } {
+    let parsed: { text: string; tags: string[]; urls: string[] };
     try {
       parsed = parse(input);
     } catch (err) {
       console.error('Message parser failed', err);
-      return { text: input, tags: [] };
+      return { text: input, tags: [], urls: [] };
     }
     if (parsed.tags.some((tag) => tag.length > MAX_TAG_LENGTH)) {
       throw new ApiError(400, `Tag names are limited to ${MAX_TAG_LENGTH} characters`);
     }
-    return { text: parsed.text, tags: parsed.tags };
+    return { text: parsed.text || input, tags: parsed.tags, urls: parsed.urls };
+  }
+
+  /** Runs after the response. A failure here leaves the saved note untouched. */
+  function enrichInBackground(userId: string, noteId: string, urls: string[]): void {
+    const { enrich } = deps;
+    if (!enrich || urls.length === 0) return;
+    void Promise.all(urls.map((url) => enrich(url).catch(() => null)))
+      .then((links) => {
+        const found = links.filter((link) => link !== null);
+        return found.length > 0 ? repos.notes.setLinks(userId, noteId, found) : undefined;
+      })
+      .catch((err: unknown) => console.error('Link enrichment failed', err));
   }
 
   async function currentMe(userId: string, csrfToken: string): Promise<MeResponse> {
@@ -169,8 +183,10 @@ export function createApi(deps: ApiDeps): Hono {
   });
 
   app.post('/api/notes', async (c) => {
-    const { text, tags } = parseNote(parseText((await readBody(c)).text));
-    const note = await repos.notes.create(c.get('session').userId, { text, source: 'web', tags });
+    const { text, tags, urls } = parseNote(parseText((await readBody(c)).text));
+    const { userId } = c.get('session');
+    const note = await repos.notes.create(userId, { text, source: 'web', tags });
+    enrichInBackground(userId, note.id, urls);
     return c.json<Api['createNote']['response']>(note);
   });
 
@@ -186,6 +202,7 @@ export function createApi(deps: ApiDeps): Hono {
     const tags = [...new Set([...existing.tags, ...parsed.tags])];
     const note = await repos.notes.update(userId, id, { text: parsed.text, tags });
     if (!note) throw notFound();
+    enrichInBackground(userId, id, parsed.urls);
     return c.json<Api['updateNote']['response']>(note);
   });
 

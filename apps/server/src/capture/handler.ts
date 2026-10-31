@@ -103,7 +103,8 @@ export function createCaptureHandler(deps: CaptureDeps): InboundHandler {
     const text = message.text.trim();
 
     const command = COMMAND.exec(text);
-    if (command) return runCommand(message, user, command[1]!, (command[2] ?? '').trim());
+    // /remind is message syntax for the time parser, not a registered command.
+    if (command && command[1]!.toLowerCase() !== 'remind') return runCommand(message, user, command[1]!, (command[2] ?? '').trim());
 
     // Parsing happens before the transaction, so a slow or failing parser holds no locks.
     const reminder = safeParseTime(text, user);

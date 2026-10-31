@@ -1,9 +1,12 @@
-import type { Channel, InboundHandler } from '@notes/core';
+import type { Channel, InboundHandler, InboundMessage } from '@notes/core';
 import { Bot, webhookCallback, type Transformer } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
 
 /** Telegram rejects messages longer than 4096 characters. */
 export const TELEGRAM_LIMIT = 4096;
+
+const POLLING_ATTEMPTS = 3;
+const SAVE_FAILED = "Couldn't save that. Please send it again.";
 
 export interface TelegramOptions {
   token: string;
@@ -12,6 +15,8 @@ export interface TelegramOptions {
   transformer?: Transformer;
   /** Test seam: skips the getMe call. */
   botInfo?: UserFromGetMe;
+  /** Test seam: base delay between polling retries. */
+  retryDelayMs?: number;
 }
 
 export type TelegramChannel = Channel & { webhookCallback(): (request: Request) => Promise<Response> };
@@ -35,7 +40,27 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
   const bot = new Bot(options.token, { botInfo: options.botInfo });
   if (options.transformer) bot.api.config.use(options.transformer);
   const { webhook } = options;
+  const retryDelayMs = options.retryDelayMs ?? 500;
   let handler: InboundHandler | null = null;
+
+  /**
+   * Polling has no redelivery, because grammY has already advanced past the
+   * update. Retry here, then tell the sender rather than losing it silently.
+   * Retrying is safe: a failed save rolled back, so nothing is duplicated.
+   */
+  async function handleWithRetry(inbound: InboundHandler, message: InboundMessage): Promise<string | null> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await inbound(message);
+      } catch (error) {
+        if (attempt >= POLLING_ATTEMPTS) {
+          console.error('Telegram update failed', error);
+          return SAVE_FAILED;
+        }
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs * attempt));
+      }
+    }
+  }
 
   async function send(recipientId: string, text: string): Promise<void> {
     for (const chunk of splitMessage(text)) await bot.api.sendMessage(recipientId, chunk);
@@ -45,13 +70,14 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
     if (!handler) throw new Error('Telegram channel has no handler yet');
     const from = ctx.from;
     const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id);
-    const reply = await handler({
+    const message: InboundMessage = {
       channel: 'telegram',
       updateId: String(ctx.update.update_id),
       senderId: String(from.id),
       senderName: name,
       text: ctx.message.text,
-    });
+    };
+    const reply = webhook ? await handler(message) : await handleWithRetry(handler, message);
     if (reply) await send(String(ctx.chat.id), reply);
   });
 
@@ -60,7 +86,8 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
   });
 
   // Webhook: rethrow so the request fails and Telegram redelivers.
-  // Polling: log and keep going, because the bot would stop otherwise.
+  // Polling: log and keep going, because the bot would stop otherwise. Failed
+  // saves never reach here in polling mode; see handleWithRetry.
   bot.catch((error) => {
     if (webhook) throw error;
     console.error('Telegram update failed', error.error);
