@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest';
-import { createLinkEnricher } from './index.ts';
+import { createServer, type Server } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createLinkEnricher, createPinnedFetch } from './index.ts';
 
 type FetchCall = { url: string; init: RequestInit | undefined };
 
@@ -373,5 +375,118 @@ describe('createLinkEnricher', () => {
         description: null,
       });
     });
+  });
+});
+
+describe('createPinnedFetch', () => {
+  let server: Server | undefined;
+  let hits = 0;
+
+  afterEach(async () => {
+    await new Promise((resolve) => (server ? server.close(resolve) : resolve(undefined)));
+    server = undefined;
+    hits = 0;
+  });
+
+  async function listen(status = 200, body = PAGE): Promise<number> {
+    const started = createServer((_request, response) => {
+      hits++;
+      response.writeHead(status, { 'content-type': 'text/html', 'x-a': 'b' });
+      response.end(status === 204 ? undefined : body);
+    });
+    server = started;
+    await new Promise<void>((resolve) => started.listen(0, '127.0.0.1', resolve));
+    return (started.address() as AddressInfo).port;
+  }
+
+  const init = () => ({ redirect: 'manual' as const, signal: new AbortController().signal, headers: {} });
+
+  it('closes the DNS rebinding gap: a name that turns private after the check never connects', async () => {
+    const port = await listen();
+    let lookups = 0;
+    // Public for the check, then loopback when the socket connects.
+    const rebinding = async () => (++lookups === 1 ? ['93.184.216.34'] : ['127.0.0.1']);
+    const enrich = createLinkEnricher({ lookup: rebinding });
+    expect(await enrich(`http://rebind.example/`)).toBeNull();
+    expect(lookups).toBe(2);
+
+    const pinned = createPinnedFetch(async () => ['127.0.0.1']);
+    await expect(pinned(`http://rebind.example:${port}/`, init())).rejects.toThrow('Blocked address');
+    expect(hits).toBe(0);
+  });
+
+  it('refuses when any resolved address is blocked or none is returned', async () => {
+    const port = await listen();
+    const mixed = createPinnedFetch(async () => ['93.184.216.34', '10.0.0.1']);
+    await expect(mixed(`http://x.example:${port}/`, init())).rejects.toThrow('Blocked address');
+    const empty = createPinnedFetch(async () => []);
+    await expect(empty(`http://x.example:${port}/`, init())).rejects.toThrow('Blocked address');
+    expect(hits).toBe(0);
+  });
+
+  it('connects to the checked address and returns a readable response', async () => {
+    const port = await listen();
+    const pinned = createPinnedFetch(async () => ['127.0.0.1'], () => false);
+    const response = await pinned(`http://allowed.example:${port}/`, init());
+    expect(response.status).toBe(200);
+    expect(response.headers.get('x-a')).toBe('b');
+    expect(await response.text()).toBe(PAGE);
+  });
+
+  it('handles a response with no body', async () => {
+    const port = await listen(204);
+    const pinned = createPinnedFetch(async () => ['127.0.0.1'], () => false);
+    expect((await pinned(`http://allowed.example:${port}/`, init())).status).toBe(204);
+  });
+
+  it('stops when the signal aborts', async () => {
+    const port = await listen();
+    const controller = new AbortController();
+    controller.abort();
+    const pinned = createPinnedFetch(async () => ['127.0.0.1'], () => false);
+    await expect(pinned(`http://allowed.example:${port}/`, { ...init(), signal: controller.signal })).rejects.toThrow();
+  });
+});
+
+describe('hostile pages', () => {
+  const enrichPage = (page: string) =>
+    createLinkEnricher({ fetch: fakeFetch(html(page)).fetch, lookup: resolvesTo('93.184.216.34'), timeoutMs: 60_000 })(
+      'https://example.com/',
+    );
+
+  it.each([
+    ['unclosed meta tags', '<meta '.repeat(200_000)],
+    ['unclosed title tags', '<title>'.repeat(150_000)],
+    ['repeated attributes', `<meta ${' content='.repeat(100_000)}`],
+  ])('parses %s in linear time', async (_name, page) => {
+    const started = performance.now();
+    await enrichPage(page);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it('keeps titles that contain angle brackets', async () => {
+    expect((await enrichPage('<title>a < b > c</title>'))?.title).toBe('a < b > c');
+  });
+
+  it('removes what jsonb cannot store', async () => {
+    const preview = await enrichPage('<title>a&#0;b\0c &#xD800;</title>');
+    expect(preview?.title).toBe('abc &#xD800;');
+    expect(JSON.stringify(preview)).not.toContain('\\u0000');
+  });
+});
+
+describe('more refused targets', () => {
+  it.each(['192.0.2.1', '198.51.100.1', '203.0.113.1', '192.88.99.1', '2001:0:4136:e378::1', '2001:db8::1'])(
+    'refuses %s',
+    async (address) => {
+      const { fetch } = fakeFetch(html(PAGE));
+      expect(await createLinkEnricher({ fetch, lookup: resolvesTo(address) })('https://example.com/')).toBeNull();
+    },
+  );
+
+  it('refuses a URL with credentials', async () => {
+    const { fetch } = fakeFetch(html(PAGE));
+    const enrich = createLinkEnricher({ fetch, lookup: resolvesTo('93.184.216.34') });
+    expect(await enrich('https://user:pass@example.com/')).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
 import type { InboundMessage } from '@notes/core';
 import type { Transformer } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
+import { inspect } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import { createTelegramChannel, splitMessage } from './telegram.ts';
 
@@ -194,5 +195,63 @@ describe('telegram channel (polling)', () => {
     });
     await vi.waitFor(() => expect(transport.sent().map((p) => p.text)).toEqual(['saved']));
     await channel.stop();
+  });
+});
+
+describe('telegram channel (hardening)', () => {
+  const groupUpdate = (id: number, text: string, type: 'group' | 'supergroup') => ({
+    update_id: id,
+    message: {
+      message_id: id,
+      date: 0,
+      chat: { id: -100, type, title: 'Friends' },
+      from: { id: 7, is_bot: false, first_name: 'Ann' },
+      text,
+    },
+  });
+
+  it.each(['group', 'supergroup'] as const)('ignores messages in a %s, so tokens never reach it', async (type) => {
+    const transport = fakeTransport();
+    const channel = createTelegramChannel({ token: 't', webhook, transformer: transport.transformer, botInfo });
+    const handler = vi.fn(async () => 'login link');
+    await channel.start(handler);
+    const response = await channel.webhookCallback()(post(groupUpdate(70, '/login', type), webhook.secret));
+    expect(response.status).toBe(200);
+    expect(handler).not.toHaveBeenCalled();
+    expect(transport.sent()).toEqual([]);
+  });
+
+  it('does not put message text or the payload in a send error', async () => {
+    const transformer: Transformer = async () =>
+      ({ ok: false, error_code: 400, description: 'Bad Request: chat not found' }) as never;
+    const channel = createTelegramChannel({ token: 't', transformer, botInfo });
+    const error = await channel.send('7', 'login token abc123').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain('chat not found');
+    expect(inspect(error, { depth: 5 })).not.toContain('abc123');
+  });
+
+  it('does not expose a transport failure, which can hold the token in a URL', async () => {
+    const transformer: Transformer = async () => {
+      throw new Error('request to https://api.telegram.org/botSECRET/sendMessage failed');
+    };
+    const channel = createTelegramChannel({ token: 'SECRET', transformer, botInfo });
+    const error = await channel.send('7', 'hello').catch((e: unknown) => e);
+    expect(inspect(error, { depth: 5 })).not.toContain('SECRET');
+  });
+
+  it('rethrows only the cause from a webhook update', async () => {
+    const transport = fakeTransport();
+    const channel = createTelegramChannel({ token: 'SECRET', webhook, transformer: transport.transformer, botInfo });
+    await channel.start(async () => {
+      throw new Error('save failed');
+    });
+    const error = await channel
+      .webhookCallback()(post(textUpdate(71, 'private note'), webhook.secret))
+      .catch((e: unknown) => e);
+    expect((error as Error).message).toBe('save failed');
+    const printed = inspect(error, { depth: 5 });
+    expect(printed).not.toContain('SECRET');
+    expect(printed).not.toContain('private note');
   });
 });

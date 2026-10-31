@@ -1,7 +1,6 @@
-import { createHash } from 'node:crypto';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createPgliteDatabase, createPostgresDatabase, createRepositories, migrate } from '@notes/db';
-import { createMcpServer } from './server.ts';
+import { authenticate, createMcpServer } from './server.ts';
 
 /** Stdout carries the protocol, so every log goes to stderr. */
 const log = (message: string) => process.stderr.write(`[mcp] ${message}\n`);
@@ -23,7 +22,7 @@ async function main() {
   await migrate(db);
 
   const repos = createRepositories(db);
-  const userId = await repos.auth.getUserIdByApiToken(createHash('sha256').update(token).digest('hex'));
+  const userId = await authenticate(repos, token);
   if (!userId) {
     log('MCP_API_TOKEN is not a valid API token');
     await db.close();

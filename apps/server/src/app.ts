@@ -8,8 +8,9 @@ import {
 } from '@notes/core';
 import type { Repositories } from '@notes/db';
 import { Hono } from 'hono';
+import { secureHeaders } from 'hono/secure-headers';
 import { createApi } from './api/index.ts';
-import { createMcpTokenCommand } from './auth/apiTokens.ts';
+import { createMcpRevokeCommand, createMcpTokenCommand } from './auth/apiTokens.ts';
 import { createLoginCommand } from './auth/login.ts';
 import { createCaptureHandler } from './capture/handler.ts';
 import { createLinkEnricher } from './enrich/index.ts';
@@ -25,7 +26,18 @@ remind me tomorrow at 9am to call Sam
 /reminders - list pending reminders
 /cancel <number> - cancel a reminder
 /timezone <name> - set your timezone, such as America/Toronto
-/mcptoken <name> - create a token for Claude access`;
+/mcptoken <name> - create a token for Claude access
+/mcprevoke <name> - revoke that token`;
+
+/** The built app has no inline scripts or styles, so nothing needs 'unsafe-inline'. */
+const CONTENT_SECURITY_POLICY = {
+  defaultSrc: ["'self'"],
+  imgSrc: ["'self'", 'data:'],
+  objectSrc: ["'none'"],
+  baseUri: ["'none'"],
+  formAction: ["'self'"],
+  frameAncestors: ["'none'"],
+};
 
 export interface AppDeps {
   repos: Repositories;
@@ -51,6 +63,7 @@ export function createApp(deps: AppDeps) {
     help,
     login: createLoginCommand({ repos, baseUrl, now }),
     mcptoken: createMcpTokenCommand({ repos }),
+    mcprevoke: createMcpRevokeCommand({ repos }),
     ...createReminderCommands({ repos }),
   };
 
@@ -65,10 +78,31 @@ export function createApp(deps: AppDeps) {
     onError: deps.onError,
   });
 
-  const worker = createReminderWorker({ repos, send: channel.send, now, onError: deps.onError });
+  const worker = createReminderWorker({
+    repos,
+    send: (recipientId, text) => channel.send(recipientId, text),
+    now,
+    onError: deps.onError,
+  });
 
   const app = new Hono();
-  app.route('/', createApi({ repos, parse: parseMessage, enrich, secureCookies: baseUrl.startsWith('https:'), now }));
+  // Errors from the webhook land here, and they can carry the bot token.
+  app.onError((error, c) => {
+    deps.onError?.(error);
+    return c.json({ error: 'Internal server error' }, 500);
+  });
+  app.use('*', secureHeaders({ contentSecurityPolicy: CONTENT_SECURITY_POLICY, xFrameOptions: 'DENY' }));
+  app.route(
+    '/',
+    createApi({
+      repos,
+      allowedSenderIds: deps.allowedSenderIds,
+      parse: parseMessage,
+      enrich,
+      secureCookies: baseUrl.startsWith('https:'),
+      now,
+    }),
+  );
   if (webhook) app.post(webhook.path, (c) => webhook.callback(c.req.raw));
   if (webRoot) {
     app.use('*', serveStatic({ root: webRoot }));

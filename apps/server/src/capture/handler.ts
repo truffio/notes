@@ -11,6 +11,7 @@ import type {
   User,
 } from '@notes/core';
 import type { Repositories } from '@notes/db';
+import { MAX_ENRICHED_URLS } from '../enrich/index.ts';
 
 export interface CaptureDeps {
   repos: Repositories;
@@ -65,7 +66,7 @@ export function createCaptureHandler(deps: CaptureDeps): InboundHandler {
     void (async () => {
       try {
         const results = await Promise.all(
-          urls.map(async (url) => {
+          urls.slice(0, MAX_ENRICHED_URLS).map(async (url) => {
             try {
               return await enrich(url);
             } catch (error) {
@@ -83,7 +84,9 @@ export function createCaptureHandler(deps: CaptureDeps): InboundHandler {
   }
 
   async function runCommand(message: InboundMessage, user: User, name: string, args: string): Promise<string | null> {
-    const command = commands[name.toLowerCase()];
+    // The map is a plain object, so /constructor must not find Object's own.
+    const key = name.toLowerCase();
+    const command = Object.hasOwn(commands, key) ? commands[key] : undefined;
     if (!command) return `Unknown command: /${name}`;
     const fresh = await repos.transaction((tx) => tx.updates.markProcessed(message.channel, message.updateId));
     if (!fresh) return null;

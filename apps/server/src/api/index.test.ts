@@ -10,6 +10,7 @@ import { createApi } from './index.ts';
 const MINUTE = 60 * 1000;
 const DAY = 24 * 60 * MINUTE;
 const MISSING_ID = '00000000-0000-4000-8000-000000000000';
+const allowedSenderIds = new Set(['1', '2']);
 
 const parse: MessageParser = (input) => ({
   text: input.replace(/#\w+/gu, '').trim(),
@@ -83,7 +84,7 @@ beforeEach(async () => {
   repos = createRepositories(db);
   time = new Date('2026-01-01T00:00:00.000Z');
   nextAddress = 1;
-  app = createApi({ repos, parse, secureCookies: true, now });
+  app = createApi({ repos, allowedSenderIds, parse, secureCookies: true, now });
   loginCommand = createLoginCommand({ repos, baseUrl: 'https://notes.test/', now });
   alice = await repos.users.upsertByTelegramId('1', 'Alice');
   bob = await repos.users.upsertByTelegramId('2', 'Bob');
@@ -155,7 +156,7 @@ describe('login flow', () => {
   });
 
   it('omits Secure when secure cookies are off', async () => {
-    const insecure = createApi({ repos, parse, secureCookies: false, now });
+    const insecure = createApi({ repos, allowedSenderIds, parse, secureCookies: false, now });
     const response = await post('/auth/login', { token: await loginToken(alice) }, {}, undefined, insecure);
     expect(response.status).toBe(200);
     expect(response.headers.get('Set-Cookie')).not.toMatch(/Secure/iu);
@@ -339,6 +340,7 @@ describe('notes', () => {
   it('saves the raw text if the parser throws', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const failing = createApi({
+      allowedSenderIds,
       repos,
       secureCookies: true,
       now,
@@ -608,6 +610,7 @@ describe('unexpected errors', () => {
     const log = vi.spyOn(console, 'error').mockImplementation(() => {});
     const client = await signIn(alice);
     const broken = createApi({
+      allowedSenderIds,
       repos: {
         ...repos,
         notes: {
@@ -625,5 +628,50 @@ describe('unexpected errors', () => {
     expect(response.status).toBe(500);
     expect(await response.json()).toEqual({ error: 'Internal server error' });
     expect(log).toHaveBeenCalled();
+  });
+});
+
+describe('hardening', () => {
+  it('rejects a valid session once its user leaves the allowlist', async () => {
+    const client = await signIn(alice);
+    expect((await client.call('GET', '/me')).status).toBe(200);
+    const narrowed = createApi({ repos, allowedSenderIds: new Set(['2']), parse, secureCookies: true, now });
+    const response = await narrowed.request('/api/me', { headers: { Cookie: client.cookie } });
+    expect(response.status).toBe(401);
+  });
+
+  it('answers an unknown path with JSON after the session check', async () => {
+    expect((await app.request('/api/nothing')).status).toBe(401);
+    const client = await signIn(alice);
+    const response = await client.call('GET', '/nothing');
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({ error: 'Not found' });
+  });
+
+  it('marks every API response as not cacheable, including errors', async () => {
+    const client = await signIn(alice);
+    expect((await client.call('GET', '/notes')).headers.get('Cache-Control')).toBe('no-store');
+    expect((await app.request('/api/me')).headers.get('Cache-Control')).toBe('no-store');
+  });
+
+  it('enriches a limited number of the URLs in one note', async () => {
+    const enrich = vi.fn(async () => null);
+    const urls = Array.from({ length: 20 }, (_, i) => `https://example.com/${i}`);
+    const withLinks = createApi({
+      repos,
+      allowedSenderIds,
+      parse: (text) => ({ text, tags: [], urls, list: null }),
+      enrich,
+      secureCookies: true,
+      now,
+    });
+    const client = await signIn(alice);
+    const response = await withLinks.request('/api/notes', {
+      method: 'POST',
+      headers: { Cookie: client.cookie, 'X-CSRF-Token': client.csrfToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'many links' }),
+    });
+    expect(response.status).toBe(200);
+    expect(enrich).toHaveBeenCalledTimes(5);
   });
 });

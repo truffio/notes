@@ -188,4 +188,20 @@ describe('capture handler', () => {
       expect(await allNotes()).toHaveLength(1);
     });
   });
+
+  describe('hardening', () => {
+    it('treats names on Object.prototype as unknown commands', async () => {
+      const handle = make();
+      expect(await handle(msg('/constructor'))).toBe('Unknown command: /constructor');
+      expect(await handle(msg('/__proto__', { updateId: '2' }))).toBe('Unknown command: /__proto__');
+    });
+
+    it('enriches a limited number of the URLs in one note', async () => {
+      const enrich = vi.fn(async () => null);
+      const urls = Array.from({ length: 20 }, (_, i) => `https://example.com/${i}`);
+      await make({ enrich, parse: (text) => ({ text, tags: [], urls, list: null }) })(msg('many links'));
+      await vi.waitFor(() => expect(enrich).toHaveBeenCalled());
+      expect(enrich).toHaveBeenCalledTimes(5);
+    });
+  });
 });

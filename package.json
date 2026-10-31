@@ -10,7 +10,7 @@
     "apps/*"
   ],
   "scripts": {
-    "typecheck": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present && tsc --noEmit -p tests",
     "lint": "eslint .",
     "test": "vitest run",
     "dev:server": "npm run dev -w @notes/server",

@@ -15,6 +15,9 @@ function required(env: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+/** Telegram's allowed characters, and long enough that it cannot be guessed. */
+const WEBHOOK_SECRET = /^[A-Za-z0-9_-]{32,256}$/;
+
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const allowedSenderIds = new Set(
     required(env, 'TELEGRAM_ALLOWED_USER_IDS')
@@ -25,6 +28,9 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const baseUrl = required(env, 'BASE_URL').replace(/\/+$/, '');
   if (!/^https?:\/\//.test(baseUrl)) throw new Error('BASE_URL must start with http:// or https://');
   const webhookSecret = env.TELEGRAM_WEBHOOK_SECRET?.trim() || undefined;
+  if (webhookSecret && !WEBHOOK_SECRET.test(webhookSecret)) {
+    throw new Error('TELEGRAM_WEBHOOK_SECRET needs 32 to 256 letters, digits, _ or -');
+  }
   if (webhookSecret && !baseUrl.startsWith('https:')) throw new Error('Webhook mode needs an https BASE_URL');
 
   return {

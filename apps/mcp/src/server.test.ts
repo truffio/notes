@@ -2,7 +2,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createPgliteDatabase, createRepositories, migrate, type Database, type Repositories } from '@notes/db';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createMcpServer } from './server.ts';
+import { authenticate, createMcpServer } from './server.ts';
 
 let db: Database;
 let repos: Repositories;
@@ -116,5 +116,30 @@ describe('user isolation', () => {
     const client = await connect(bob);
     const result = await call(client, 'list_recent_notes', { userId: alice });
     expect(JSON.parse(result.text)).toEqual([]);
+  });
+});
+
+describe('input limits', () => {
+  it.each([
+    ['a long query', { query: 'x'.repeat(5000) }],
+    ['a NUL in the query', { query: 'a\0b' }],
+    ['a long tag', { query: 'a', tag: 'x'.repeat(65) }],
+    ['a NUL in the tag', { query: 'a', tag: 'a\0b' }],
+  ])('refuses %s without reaching Postgres', async (_name, args) => {
+    const result = await call(await connect(alice), 'search_notes', args);
+    expect(result.isError).toBe(true);
+    expect(result.text).toMatch(/validation/iu);
+  });
+});
+
+describe('authenticate', () => {
+  it('finds the user by the SHA-256 of the token', async () => {
+    await repos.auth.createApiToken(
+      alice,
+      '2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae',
+      'laptop',
+    );
+    expect(await authenticate(repos, 'foo')).toBe(alice);
+    expect(await authenticate(repos, 'bar')).toBeNull();
   });
 });

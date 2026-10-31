@@ -1,5 +1,5 @@
 import type { Channel, InboundHandler, InboundMessage } from '@notes/core';
-import { Bot, webhookCallback, type Transformer } from 'grammy';
+import { Bot, BotError, GrammyError, webhookCallback, type Transformer } from 'grammy';
 import type { UserFromGetMe } from 'grammy/types';
 
 /** Telegram rejects messages longer than 4096 characters. */
@@ -36,6 +36,16 @@ export function splitMessage(text: string, limit = TELEGRAM_LIMIT): string[] {
   return chunks;
 }
 
+/**
+ * grammY errors carry the full request payload, which here holds note text,
+ * login links and MCP tokens, and may wrap a fetch error whose message has the
+ * bot token in its URL. So only the Telegram error text leaves this module.
+ */
+function toSafeError(error: unknown): Error {
+  if (error instanceof GrammyError) return new Error(`Telegram refused the message: ${error.description}`);
+  return new Error('Could not reach Telegram');
+}
+
 export function createTelegramChannel(options: TelegramOptions): TelegramChannel {
   const bot = new Bot(options.token, { botInfo: options.botInfo });
   if (options.transformer) bot.api.config.use(options.transformer);
@@ -63,10 +73,18 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
   }
 
   async function send(recipientId: string, text: string): Promise<void> {
-    for (const chunk of splitMessage(text)) await bot.api.sendMessage(recipientId, chunk);
+    for (const chunk of splitMessage(text)) {
+      await bot.api.sendMessage(recipientId, chunk).catch((error: unknown) => {
+        throw toSafeError(error);
+      });
+    }
   }
 
-  bot.on('message:text', async (ctx) => {
+  // Replies can hold login links and tokens, and go to the chat the message came
+  // from. In a group, everyone there would read them, so only direct chats count.
+  const direct = bot.chatType('private');
+
+  direct.on('message:text', async (ctx) => {
     if (!handler) throw new Error('Telegram channel has no handler yet');
     const from = ctx.from;
     const name = [from.first_name, from.last_name].filter(Boolean).join(' ') || from.username || String(from.id);
@@ -81,7 +99,7 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
     if (reply) await send(String(ctx.chat.id), reply);
   });
 
-  bot.on('message', async (ctx) => {
+  direct.on('message', async (ctx) => {
     await send(String(ctx.chat.id), 'Text only for now.');
   });
 
@@ -117,7 +135,16 @@ export function createTelegramChannel(options: TelegramOptions): TelegramChannel
     send,
 
     webhookCallback() {
-      return webhookCallback(bot, 'std/http', { secretToken: webhook?.secret });
+      const callback = webhookCallback(bot, 'std/http', { secretToken: webhook?.secret });
+      return async (request) => {
+        try {
+          return await callback(request);
+        } catch (error) {
+          // The cause only: a BotError holds the update, with the message text,
+          // and the Api object, with the token, and the caller will log this.
+          throw error instanceof BotError ? error.error : error;
+        }
+      };
     },
   };
 }

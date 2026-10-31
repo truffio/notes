@@ -1,13 +1,25 @@
 import { lookup as dnsLookup } from 'node:dns/promises';
-import { isIP } from 'node:net';
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import { isIP, type LookupFunction } from 'node:net';
+import { Readable } from 'node:stream';
 import type { LinkEnricher, LinkPreview } from '@notes/core';
 
+type FetchLike = (
+  url: string,
+  init: { redirect: 'manual'; signal: AbortSignal; headers: Record<string, string> },
+) => Promise<Response>;
+
 export interface LinkEnricherOptions {
-  fetch?: typeof fetch;
+  /** Test seam. The default re-checks addresses at connect time; see createPinnedFetch. */
+  fetch?: FetchLike;
   lookup?: (hostname: string) => Promise<string[]>;
   timeoutMs?: number;
   maxBytes?: number;
 }
+
+/** A note can hold hundreds of URLs, and each one costs a fetch of up to DEFAULT_MAX_BYTES. */
+export const MAX_ENRICHED_URLS = 5;
 
 const DEFAULT_TIMEOUT_MS = 5000;
 const DEFAULT_MAX_BYTES = 1024 * 1024;
@@ -15,6 +27,7 @@ const MAX_REDIRECTS = 3;
 const MAX_CHARS = 300;
 const ALLOWED_PORTS = new Set(['80', '443']);
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
 
 /** Blocked IPv4 ranges as [base, prefix length]. */
 const BLOCKED_IPV4: Array<[string, number]> = [
@@ -25,8 +38,12 @@ const BLOCKED_IPV4: Array<[string, number]> = [
   ['169.254.0.0', 16],
   ['172.16.0.0', 12],
   ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.88.99.0', 24],
   ['192.168.0.0', 16],
   ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
   ['224.0.0.0', 4],
   ['240.0.0.0', 4],
 ];
@@ -35,8 +52,8 @@ const BLOCKED_IPV4_RANGES = BLOCKED_IPV4.map(([base, bits]) => [ipv4ToInt(base),
 
 /** Creates a link enricher that fetches a page's title and description. Never throws. */
 export function createLinkEnricher(options: LinkEnricherOptions = {}): LinkEnricher {
-  const doFetch = options.fetch ?? fetch;
   const lookup = options.lookup ?? defaultLookup;
+  const doFetch = options.fetch ?? createPinnedFetch(lookup);
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 
@@ -52,8 +69,67 @@ export function createLinkEnricher(options: LinkEnricherOptions = {}): LinkEnric
   };
 }
 
+/**
+ * A fetch that checks addresses at the moment it connects. Checking a hostname
+ * and then calling global fetch leaves a gap: fetch resolves it again, so a DNS
+ * record with a short TTL can pass the check and then point at a private address.
+ * Here the addresses that were checked are the ones the socket connects to.
+ */
+export function createPinnedFetch(
+  resolve: (hostname: string) => Promise<string[]>,
+  isBlocked: (address: string) => boolean = isBlockedAddress,
+): FetchLike {
+  const pinned = ((hostname: string, options: { all?: boolean }, callback: (...args: unknown[]) => void) => {
+    resolve(hostname).then(
+      (addresses) => {
+        const first = addresses[0];
+        if (first === undefined || addresses.some(isBlocked)) {
+          callback(new Error(`Blocked address for ${hostname}`));
+        } else if (options.all) {
+          callback(null, addresses.map((address) => ({ address, family: isIP(address) })));
+        } else {
+          callback(null, first, isIP(first));
+        }
+      },
+      (error: unknown) => callback(error),
+    );
+  }) as LookupFunction;
+
+  return (url, init) =>
+    new Promise((resolveResponse, reject) => {
+      const target = new URL(url);
+      const request = target.protocol === 'https:' ? httpsRequest : httpRequest;
+      const outgoing = request(
+        target,
+        // No keep-alive agent, so every request goes through the lookup above.
+        // Identity because, unlike fetch, this does not decompress responses.
+        { agent: false, lookup: pinned, signal: init.signal, headers: { ...init.headers, 'accept-encoding': 'identity' } },
+        (incoming) => {
+          try {
+            resolveResponse(toResponse(incoming));
+          } catch (error) {
+            incoming.destroy();
+            reject(error instanceof Error ? error : new Error('Invalid response'));
+          }
+        },
+      );
+      outgoing.on('error', reject);
+      outgoing.end();
+    });
+}
+
+function toResponse(incoming: IncomingMessage): Response {
+  const status = incoming.statusCode ?? 502;
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(incoming.headers)) {
+    for (const item of [value ?? []].flat()) headers.append(name, item);
+  }
+  const body = NULL_BODY_STATUSES.has(status) ? null : (Readable.toWeb(incoming) as ReadableStream<Uint8Array>);
+  return new Response(body, { status, headers });
+}
+
 interface FetchContext {
-  doFetch: typeof fetch;
+  doFetch: FetchLike;
   lookup: (hostname: string) => Promise<string[]>;
   maxBytes: number;
   signal: AbortSignal;
@@ -142,7 +218,9 @@ function parseMeta(html: string): Meta {
   let ogDescription: string | null = null;
   let metaDescription: string | null = null;
 
-  for (const tag of html.match(/<meta\b[^>]*>/gi) ?? []) {
+  // Excluding `<` keeps these patterns linear. With `[^>]*` a page of repeated
+  // `<meta` is quadratic, and that blocks the event loop past any timeout.
+  for (const tag of html.match(/<meta\b[^<>]*>/gi) ?? []) {
     const key = (readAttribute(tag, 'property') ?? readAttribute(tag, 'name'))?.toLowerCase();
     const content = readAttribute(tag, 'content');
     if (!key || content === null) continue;
@@ -151,12 +229,18 @@ function parseMeta(html: string): Meta {
     if (key === 'description' && metaDescription === null) metaDescription = content;
   }
 
-  const titleTag = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? null;
-
   return {
-    title: clean(ogTitle ?? titleTag),
+    title: clean(ogTitle ?? readTitle(html)),
     description: clean(ogDescription ?? metaDescription),
   };
+}
+
+function readTitle(html: string): string | null {
+  const open = /<title\b[^<>]*>/i.exec(html);
+  if (!open) return null;
+  const rest = html.slice(open.index + open[0].length);
+  const close = /<\/title>/i.exec(rest);
+  return close ? rest.slice(0, close.index) : null;
 }
 
 function readAttribute(tag: string, name: string): string | null {
@@ -166,7 +250,8 @@ function readAttribute(tag: string, name: string): string | null {
 
 function clean(raw: string | null): string | null {
   if (raw === null) return null;
-  const text = decodeEntities(raw).replace(/\s+/g, ' ').trim();
+  // jsonb cannot hold a NUL, and one bad title would lose every preview on the note.
+  const text = decodeEntities(raw).replaceAll('\0', '').replace(/\s+/g, ' ').trim();
   const trimmed = Array.from(text).slice(0, MAX_CHARS).join('').trim();
   return trimmed === '' ? null : trimmed;
 }
@@ -189,7 +274,9 @@ function decodeEntities(text: string): string {
 }
 
 function fromCodePoint(codePoint: number, fallback: string): string {
-  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff) return fallback;
+  // Surrogates are excluded because jsonb rejects them when unpaired.
+  const invalid = codePoint >= 0xd800 && codePoint <= 0xdfff;
+  if (!Number.isInteger(codePoint) || codePoint < 0 || codePoint > 0x10ffff || invalid) return fallback;
   return String.fromCodePoint(codePoint);
 }
 
@@ -201,6 +288,7 @@ function parseTarget(input: string): URL | null {
     return null;
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (url.username !== '' || url.password !== '') return null;
   const port = url.port || (url.protocol === 'https:' ? '443' : '80');
   if (!ALLOWED_PORTS.has(port)) return null;
   return url;
@@ -250,6 +338,9 @@ function isBlockedIPv6(address: string): boolean {
   // 2002::/16 6to4, checked against the embedded IPv4 address.
   if (bytes[0] === 0x20 && bytes[1] === 0x02) return isBlockedIPv4Int(ipv4At(2));
 
+  // 2001::/32 Teredo and 2001:db8::/32 documentation.
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x00 && bytes[3] === 0x00) return true;
+  if (bytes[0] === 0x20 && bytes[1] === 0x01 && bytes[2] === 0x0d && bytes[3] === 0xb8) return true;
   // fc00::/7 unique local.
   if ((bytes[0]! & 0xfe) === 0xfc) return true;
   // fe80::/10 link-local.

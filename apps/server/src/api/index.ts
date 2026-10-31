@@ -6,6 +6,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { deleteCookie, getCookie, setCookie } from 'hono/cookie';
 import { createMiddleware } from 'hono/factory';
 import { generateToken, hashToken, tokensMatch } from '../auth/tokens.ts';
+import { MAX_ENRICHED_URLS } from '../enrich/index.ts';
 import { createRateLimiter } from './rateLimit.ts';
 import {
   ApiError,
@@ -29,6 +30,8 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 export interface ApiDeps {
   repos: Repositories;
+  /** Checked on every request, so removing someone also ends their sessions. */
+  allowedSenderIds: Set<string>;
   parse: MessageParser;
   secureCookies: boolean;
   /** Fills link previews in the background. Without it, web notes have none. */
@@ -60,7 +63,7 @@ const toMe = (user: User, csrfToken: string): MeResponse => ({
 });
 
 export function createApi(deps: ApiDeps): Hono {
-  const { repos, parse, secureCookies } = deps;
+  const { repos, allowedSenderIds, parse, secureCookies } = deps;
   const now = deps.now ?? (() => new Date());
   const loginLimiter = createRateLimiter(LOGIN_ATTEMPTS_PER_WINDOW, LOGIN_WINDOW_MS);
   const cookieOptions = { httpOnly: true, sameSite: 'Lax', path: '/', secure: secureCookies } as const;
@@ -73,6 +76,15 @@ export function createApi(deps: ApiDeps): Hono {
     return c.json({ error: 'Internal server error' }, 500);
   });
   app.notFound((c) => c.json({ error: 'Not found' }, 404));
+
+  // Notes must not linger in a browser or proxy cache after logout.
+  app.use(
+    '/api/*',
+    createMiddleware<AppEnv>(async (c, next) => {
+      await next();
+      c.header('Cache-Control', 'no-store');
+    }),
+  );
 
   app.use(
     '/api/*',
@@ -106,7 +118,7 @@ export function createApi(deps: ApiDeps): Hono {
       if (!token) throw new ApiError(401, 'Not signed in');
       const tokenHash = hashToken(token);
       const session = await repos.auth.getSession(tokenHash, now());
-      if (!session) throw new ApiError(401, 'Not signed in');
+      if (!session || !allowedSenderIds.has(session.telegramId)) throw new ApiError(401, 'Not signed in');
       c.set('session', { ...session, tokenHash });
       await next();
     }),
@@ -145,7 +157,7 @@ export function createApi(deps: ApiDeps): Hono {
   function enrichInBackground(userId: string, noteId: string, urls: string[]): void {
     const { enrich } = deps;
     if (!enrich || urls.length === 0) return;
-    void Promise.all(urls.map((url) => enrich(url).catch(() => null)))
+    void Promise.all(urls.slice(0, MAX_ENRICHED_URLS).map((url) => enrich(url).catch(() => null)))
       .then((links) => {
         const found = links.filter((link) => link !== null);
         return found.length > 0 ? repos.notes.setLinks(userId, noteId, found) : undefined;
@@ -276,6 +288,10 @@ export function createApi(deps: ApiDeps): Hono {
     if (!(await repos.reminders.cancel(c.get('session').userId, id))) throw notFound();
     return c.json<Api['cancelReminder']['response']>({ ok: true });
   });
+
+  // A mounted app's notFound handler is not used, and an unknown /api path would
+  // otherwise fall through to whatever the parent serves, such as the app shell.
+  app.all('/api/*', (c) => c.json({ error: 'Not found' }, 404));
 
   // The session variable is internal, so callers see a plain Hono app.
   return app as unknown as Hono;

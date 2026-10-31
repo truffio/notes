@@ -5,6 +5,7 @@ import type { Database, Queryable } from './client.ts';
 export class ConflictError extends Error {}
 
 const MAX_PAGE = 100;
+const UNIQUE_VIOLATION = '23505';
 
 const iso = (value: Date | string) => new Date(value).toISOString();
 
@@ -208,11 +209,17 @@ function createStores(db: Queryable) {
         [userId, name, id],
       );
       if (taken.length > 0) throw new ConflictError(`Tag "${name}" already exists`);
-      const { rows } = await db.query<{ id: string; name: string; note_count: number }>(
-        `UPDATE tags t SET name = $3 WHERE t.user_id = $1 AND t.id = $2
-         RETURNING t.id, t.name, ${TAG_COUNT} AS note_count`,
-        [userId, id, name],
-      );
+      const { rows } = await db
+        .query<{ id: string; name: string; note_count: number }>(
+          `UPDATE tags t SET name = $3 WHERE t.user_id = $1 AND t.id = $2
+           RETURNING t.id, t.name, ${TAG_COUNT} AS note_count`,
+          [userId, id, name],
+        )
+        .catch((error: { code?: string }) => {
+          // A concurrent rename can take the name after the check above.
+          if (error.code === UNIQUE_VIOLATION) throw new ConflictError(`Tag "${name}" already exists`);
+          throw error;
+        });
       return rows[0] ? { id: rows[0].id, name: rows[0].name, noteCount: rows[0].note_count } : null;
     },
 
@@ -292,7 +299,7 @@ function createStores(db: Queryable) {
     async create(userId: string, input: { noteId: string | null; text: string; remindAt: Date }): Promise<Reminder> {
       const { rows } = await db.query<ReminderRow>(
         `INSERT INTO reminders (user_id, note_id, text, remind_at, next_attempt_at)
-         VALUES ($1, $2, $3, $4, $4) RETURNING *`,
+         VALUES ($1, (SELECT id FROM notes WHERE id = $2 AND user_id = $1), $3, $4, $4) RETURNING *`,
         [userId, input.noteId, input.text, input.remindAt.toISOString()],
       );
       return toReminder(rows[0]!);
@@ -318,16 +325,21 @@ function createStores(db: Queryable) {
     /**
      * Atomically claims due reminders. A claim older than `staleBefore` is taken
      * over, so a crash mid-send cannot strand a reminder.
+     *
+     * The CTE is materialized so the locking SELECT runs exactly once. As an
+     * `IN` subquery the planner may rescan it, and each rescan skips the rows
+     * already locked and returns new ones, which claims more than `limit`.
      */
     async claimDue(now: Date, staleBefore: Date, limit: number): Promise<Reminder[]> {
       const { rows } = await db.query<ReminderRow>(
-        `UPDATE reminders SET status = 'sending', claimed_at = $1, attempts = attempts + 1
-         WHERE id IN (
+        `WITH due AS MATERIALIZED (
            SELECT id FROM reminders
            WHERE (status = 'pending' AND next_attempt_at <= $1)
               OR (status = 'sending' AND claimed_at < $2)
            ORDER BY next_attempt_at LIMIT $3 FOR UPDATE SKIP LOCKED
-         ) RETURNING *`,
+         )
+         UPDATE reminders r SET status = 'sending', claimed_at = $1, attempts = r.attempts + 1
+         FROM due WHERE r.id = due.id RETURNING r.*`,
         [now.toISOString(), staleBefore.toISOString(), limit],
       );
       return rows.map(toReminder);
@@ -399,12 +411,17 @@ function createStores(db: Queryable) {
       ]);
     },
 
-    async getSession(tokenHash: string, now: Date): Promise<{ userId: string; csrfToken: string } | null> {
-      const { rows } = await db.query<{ user_id: string; csrf_token: string }>(
-        'SELECT user_id, csrf_token FROM sessions WHERE token_hash = $1 AND expires_at > $2',
+    async getSession(
+      tokenHash: string,
+      now: Date,
+    ): Promise<{ userId: string; telegramId: string; csrfToken: string } | null> {
+      const { rows } = await db.query<{ user_id: string; telegram_id: string; csrf_token: string }>(
+        `SELECT s.user_id, u.telegram_id, s.csrf_token FROM sessions s JOIN users u ON u.id = s.user_id
+         WHERE s.token_hash = $1 AND s.expires_at > $2`,
         [tokenHash, now.toISOString()],
       );
-      return rows[0] ? { userId: rows[0].user_id, csrfToken: rows[0].csrf_token } : null;
+      const row = rows[0];
+      return row ? { userId: row.user_id, telegramId: row.telegram_id, csrfToken: row.csrf_token } : null;
     },
 
     async deleteSession(tokenHash: string): Promise<void> {
@@ -423,6 +440,15 @@ function createStores(db: Queryable) {
         userId,
         name,
       ]);
+    },
+
+    /** Returns how many tokens were removed. Names are not unique. */
+    async deleteApiTokens(userId: string, name: string): Promise<number> {
+      const { rows } = await db.query('DELETE FROM api_tokens WHERE user_id = $1 AND name = $2 RETURNING name', [
+        userId,
+        name,
+      ]);
+      return rows.length;
     },
 
     async getUserIdByApiToken(tokenHash: string): Promise<string | null> {

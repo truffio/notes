@@ -3,12 +3,22 @@ import { createPgliteDatabase, createPostgresDatabase, createRepositories, migra
 import { createApp } from './app.ts';
 import { createTelegramChannel } from './channels/telegram.ts';
 import { loadConfig } from './config.ts';
+import { redactConsole } from './log.ts';
 
 const PURGE_INTERVAL_MS = 60 * 60 * 1000;
 const UPDATE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 const WEBHOOK_PATH = '/telegram/webhook';
 
+// Registered first, so a failure at startup is redacted like any other log. This
+// also catches a rejected top-level await and unhandled rejections.
+process.on('uncaughtException', (error) => {
+  console.error(error);
+  process.exit(1);
+});
+
 const config = loadConfig(process.env);
+redactConsole([config.telegramToken, config.webhookSecret, config.databaseUrl]);
+
 const db = config.databaseUrl ? createPostgresDatabase(config.databaseUrl) : createPgliteDatabase(config.pgliteDataDir);
 await migrate(db);
 const repos = createRepositories(db);
