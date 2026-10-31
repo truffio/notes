@@ -1,0 +1,13 @@
+{
+  "name": "Notes",
+  "short_name": "Notes",
+  "description": "Message-first notes",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#3b6cf6",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
