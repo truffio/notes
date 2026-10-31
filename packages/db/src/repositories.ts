@@ -1,5 +1,5 @@
 import type { LinkPreview, List, ListItem, Note, Page, Reminder, ReminderStatus, Source, Tag, User } from '@notes/core';
-import type { Database } from './client.ts';
+import type { Database, Queryable } from './client.ts';
 
 /** Raised when a rename collides with an existing name. */
 export class ConflictError extends Error {}
@@ -99,7 +99,7 @@ export interface ListNotesOptions {
   q?: string;
 }
 
-export function createRepositories(db: Database) {
+function createStores(db: Queryable) {
   async function setNoteTags(userId: string, noteId: string, tags: string[]) {
     await db.query('DELETE FROM note_tags WHERE note_id = $1', [noteId]);
     for (const name of new Set(tags)) {
@@ -441,6 +441,16 @@ export function createRepositories(db: Database) {
   };
 
   return { users, notes, tags, lists, reminders, auth, updates };
+}
+
+export type Stores = ReturnType<typeof createStores>;
+
+export function createRepositories(db: Database) {
+  return {
+    ...createStores(db),
+    /** Runs `fn` atomically. Inside it, use only the stores it receives. */
+    transaction: <T>(fn: (stores: Stores) => Promise<T>) => db.transaction((tx) => fn(createStores(tx))),
+  };
 }
 
 export type Repositories = ReturnType<typeof createRepositories>;

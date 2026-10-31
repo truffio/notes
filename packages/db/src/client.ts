@@ -2,9 +2,14 @@ import { PGlite } from '@electric-sql/pglite';
 import pg from 'pg';
 import { migrations } from './schema.ts';
 
-export interface Database {
+export interface Queryable {
   query<T>(sql: string, params?: unknown[]): Promise<{ rows: T[] }>;
+}
+
+export interface Database extends Queryable {
   exec(sql: string): Promise<void>;
+  /** Commits when `fn` resolves and rolls back when it rejects. */
+  transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T>;
   close(): Promise<void>;
 }
 
@@ -19,6 +24,17 @@ export function createPgliteDatabase(dataDir?: string): Database {
     exec: async (sql) => {
       await client.exec(sql);
     },
+    transaction: async <T>(fn: (tx: Queryable) => Promise<T>) => {
+      const result = await client.transaction((tx) =>
+        fn({
+          query: async <R>(sql: string, params: unknown[] = []) => {
+            const { rows } = await tx.query<R>(sql, params);
+            return { rows };
+          },
+        }),
+      );
+      return result as T;
+    },
     close: () => client.close(),
   };
 }
@@ -32,6 +48,25 @@ export function createPostgresDatabase(connectionString: string): Database {
     },
     exec: async (sql) => {
       await pool.query(sql);
+    },
+    transaction: async <T>(fn: (tx: Queryable) => Promise<T>) => {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        const result = await fn({
+          query: async <R>(sql: string, params: unknown[] = []) => {
+            const { rows } = await client.query(sql, params);
+            return { rows: rows as R[] };
+          },
+        });
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
+      } finally {
+        client.release();
+      }
     },
     close: () => pool.end(),
   };

@@ -119,3 +119,21 @@ describe('updates', () => {
     expect(await repos.updates.markProcessed('telegram', '1')).toBe(false);
   });
 });
+
+describe('transaction', () => {
+  it('rolls back the mark and the save together, so a retry can succeed', async () => {
+    const save = (fail: boolean) =>
+      repos.transaction(async (tx) => {
+        if (!(await tx.updates.markProcessed('telegram', '9'))) return false;
+        await tx.notes.create(alice, { text: 'kept', source: 'telegram' });
+        if (fail) throw new Error('boom');
+        return true;
+      });
+
+    await expect(save(true)).rejects.toThrow('boom');
+    expect((await repos.notes.list(alice)).items).toEqual([]);
+    expect(await save(false)).toBe(true);
+    expect(await save(false)).toBe(false);
+    expect((await repos.notes.list(alice)).items).toHaveLength(1);
+  });
+});
