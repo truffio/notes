@@ -1,0 +1,36 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    # Values from .env, such as TELEGRAM_BOT_TOKEN and BASE_URL.
+    env_file: .env
+    environment:
+      # Built from POSTGRES_PASSWORD, which Compose reads from .env.
+      DATABASE_URL: postgres://notes:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/notes
+    ports:
+      # Bound to loopback. Put a reverse proxy with https in front of it.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: notes
+      POSTGRES_DB: notes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Loopback only, so a Claude MCP server on this host can reach the database.
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notes"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pgdata:
